@@ -225,6 +225,11 @@ Comment on the issue while the loop runs. Before every fresh iteration, `ralph-g
 
 The controller owns `gh`. It removes `GH_TOKEN`, `GITHUB_TOKEN`, and `GITHUB_PAT` from the agent process. For stronger isolation, run each worktree/agent invocation in Docker, Podman, or Apptainer. Protect the default branch and require human approval.
 
+When a run fails, the controller applies `ralph-failed` and posts an issue
+comment containing the failed stage, a safe reason, the exit status, retry
+instructions, and whether the worktree was retained. Raw commands and agent
+logs are not copied into the comment because they may contain secrets.
+
 ## MVP limitations
 
 - Local checkout required.
