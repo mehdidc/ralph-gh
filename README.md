@@ -66,13 +66,62 @@ Run it from a checkout of the target repository.
 
 ## Configure
 
-The agent command must accept the prompt as its final argument:
+The agent command must accept the prompt as its final argument. Install and
+authenticate the CLI you want to use first, then set `RALPH_AGENT_CMD` as shown
+below.
+
+### OpenCode
 
 ```bash
 export RALPH_AGENT_CMD='opencode run'
-# alternatives, after checking their current CLI syntax:
-# export RALPH_AGENT_CMD='codex exec --full-auto'
-# export RALPH_AGENT_CMD='claude --print --dangerously-skip-permissions'
+```
+
+`opencode run` starts a non-interactive OpenCode session. `ralph-gh` appends its
+iteration prompt after `run`.
+
+### Codex
+
+Use [`codex exec`](https://developers.openai.com/codex/cli/reference) for a
+non-interactive run and allow writes only inside the worktree:
+
+```bash
+export RALPH_AGENT_CMD='codex exec --sandbox workspace-write'
+```
+
+Codex reads the appended Ralph prompt as its positional `PROMPT` argument. The
+`workspace-write` sandbox lets it edit, test, and commit in the isolated
+worktree without giving it unrestricted access to the host. The older
+`--full-auto` flag is deprecated and should not be used in new configurations.
+
+Before starting Ralph, confirm that Codex is authenticated and can run in the
+target repository:
+
+```bash
+codex exec --sandbox workspace-write 'Inspect this repository and exit without making changes.'
+```
+
+### Claude Code
+
+Claude Code must use
+[`--print`](https://docs.anthropic.com/en/docs/claude-code/cli-usage) so that it
+runs non-interactively and exits after the iteration:
+
+```bash
+export RALPH_AGENT_CMD='claude --print --dangerously-skip-permissions'
+```
+
+`--dangerously-skip-permissions` is needed for a fully unattended loop because
+Claude must be able to edit files, run checks, and commit without waiting for
+permission prompts. It disables Claude Code's permission checks, so use this
+configuration only when the agent process is isolated in a container or VM.
+An isolated Git worktree prevents branch conflicts but is not a security
+sandbox.
+
+Before starting Ralph, complete Claude Code's normal authentication flow and
+test non-interactive mode in the target repository:
+
+```bash
+claude --print 'Inspect this repository and exit without making changes.'
 ```
 
 Deterministic completion is mandatory:
