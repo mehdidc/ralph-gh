@@ -14,6 +14,9 @@ Options:
   --repo OWNER/REPO
   --max-iterations N
   --agent-cmd CMD
+  --review-agent-cmd CMD
+  --max-review-rounds N
+  --no-review
   --verify-cmd CMD
   --base BRANCH
   --reviewer USER
@@ -26,12 +29,13 @@ need git; need gh; need jq
 COMMAND=${1:-}; [[ -n "$COMMAND" ]] || { usage; exit 2; }; shift || true
 ISSUE=""
 if [[ "$COMMAND" == run || "$COMMAND" == status ]]; then ISSUE=${1:-}; [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "Issue number required"; shift; fi
-REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}
+REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}
 READY_LABEL=${RALPH_READY_LABEL:-ralph-ready}; RUNNING_LABEL=${RALPH_RUNNING_LABEL:-ralph-running}; REVIEW_LABEL=${RALPH_REVIEW_LABEL:-ralph-review}; FAILED_LABEL=${RALPH_FAILED_LABEL:-ralph-failed}
 BASE=""; REVIEWER=${RALPH_REVIEWER:-}; OPEN_PR=1; COMMENTS=1; KEEP_WORKTREE=0; WORK_ROOT=${RALPH_WORK_ROOT:-${TMPDIR:-/tmp}/ralph-gh}
 while [[ $# -gt 0 ]]; do
  case "$1" in
-  --repo) REPO=$2; shift 2;; --max-iterations) MAX_ITERATIONS=$2; shift 2;; --agent-cmd) AGENT_CMD=$2; shift 2;; --verify-cmd) VERIFY_CMD=$2; shift 2;;
+  --repo) REPO=$2; shift 2;; --max-iterations) MAX_ITERATIONS=$2; shift 2;; --agent-cmd) AGENT_CMD=$2; shift 2;;
+  --review-agent-cmd) REVIEW_AGENT_CMD=$2; shift 2;; --max-review-rounds) MAX_REVIEW_ROUNDS=$2; shift 2;; --no-review) REVIEW_AGENT_CMD=""; shift;; --verify-cmd) VERIFY_CMD=$2; shift 2;;
   --base) BASE=$2; shift 2;; --reviewer) REVIEWER=$2; shift 2;; --no-pr) OPEN_PR=0; shift;; --no-comments) COMMENTS=0; shift;; --keep-worktree) KEEP_WORKTREE=1; shift;;
   -h|--help) usage; exit 0;; *) die "Unknown option: $1";;
  esac
@@ -47,6 +51,7 @@ TITLE=$(jq -r .title <<<"$issue_json"); ISSUE_URL=$(jq -r .url <<<"$issue_json")
 if [[ "$COMMAND" == status ]]; then printf 'Repository: %s\nIssue: #%s %s\nURL: %s\nBranch: %s\n' "$REPO" "$ISSUE" "$TITLE" "$ISSUE_URL" "$BRANCH"; gh pr list -R "$REPO" --head "$BRANCH" --state all --json number,state,isDraft,url --jq '.[] | "PR #\(.number) [\(.state)] draft=\(.isDraft) \(.url)"'; exit 0; fi
 [[ "$COMMAND" == run || "$COMMAND" == next ]] || die "Unknown command"
 [[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ -n "$VERIFY_CMD" ]] || die "Set RALPH_VERIFY_CMD or --verify-cmd"; [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"
+[[ -z "$REVIEW_AGENT_CMD" || "$MAX_REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "Bad review round count"
 create_labels
 labels=$(jq -r '.labels[].name' <<<"$issue_json"); { grep -Fxq "$READY_LABEL" <<<"$labels" || grep -Fxq "$RUNNING_LABEL" <<<"$labels"; } || die "Issue needs $READY_LABEL"
 existing=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty'); [[ -z "$existing" ]] || die "Open PR already exists: $existing"
@@ -88,9 +93,51 @@ for ((i=1;i<=MAX_ITERATIONS;i++)); do
  write_issue
  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
  if [[ $verify_rc -eq 0 ]]; then verified=1; break; fi
- done
+done
 [[ $verified -eq 1 ]] || die "Verification failed after $MAX_ITERATIONS iterations"
-if ! git -C "$WORKTREE" diff --quiet || ! git -C "$WORKTREE" diff --cached --quiet; then git -C "$WORKTREE" add -A; git -C "$WORKTREE" reset -- .ralph >/dev/null 2>&1 || true; git -C "$WORKTREE" diff --cached --quiet || git -C "$WORKTREE" commit -m "Complete issue #$ISSUE"; fi
+commit_pending(){ if ! git -C "$WORKTREE" diff --quiet || ! git -C "$WORKTREE" diff --cached --quiet; then git -C "$WORKTREE" add -A; git -C "$WORKTREE" reset -- .ralph >/dev/null 2>&1 || true; git -C "$WORKTREE" diff --cached --quiet || git -C "$WORKTREE" commit -m "$1"; fi; }
+commit_pending "Complete issue #$ISSUE"
+review_summary="Disabled."
+if [[ -n "$REVIEW_AGENT_CMD" ]]; then
+ mkdir -p "$STATE_DIR/reviews"; review_approved=0
+ for ((review_round=1;review_round<=MAX_REVIEW_ROUNDS;review_round++)); do
+  review_file="$STATE_DIR/reviews/round-$review_round.md"; fix_log="$STATE_DIR/reviews/fix-$review_round.log"
+  cat > "$STATE_DIR/review-prompt.md" <<REVIEWPROMPT
+You are a fresh, independent reviewer for GitHub issue #$ISSUE.
+Read .ralph/issue.md, repository instructions such as AGENTS.md, .ralph/progress.md if present, recent Git history, and the complete diff from origin/$BASE to HEAD.
+Review only; do not edit files, commit, invoke gh, push, or open a PR.
+Look for actionable correctness, security, compatibility, and test-coverage problems introduced by the changes. Avoid style-only comments and speculative improvements.
+This is review round $review_round of $MAX_REVIEW_ROUNDS. Read earlier reports and responses in .ralph/reviews if present, and verify claimed fixes independently.
+If there are actionable findings, explain each with severity, file and line where possible, impact, and a concrete fix. Do not print the approval marker.
+If there are no actionable findings, end your response with this exact line:
+RALPH_REVIEW_APPROVED
+REVIEWPROMPT
+  log "Review round $review_round/$MAX_REVIEW_ROUNDS"
+  set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$REVIEW_AGENT_CMD \"\$(cat .ralph/review-prompt.md)\"") 2>&1 | tee "$review_file" | tee -a "$RUN_LOG"; review_rc=${PIPESTATUS[0]}; set -e
+  [[ $review_rc -eq 0 ]] || die "Review agent failed in round $review_round"
+  review_verdict=$(awk 'NF { line=$0 } END { print line }' "$review_file")
+  if [[ "$review_verdict" == "RALPH_REVIEW_APPROVED" ]]; then review_approved=1; break; fi
+  [[ $review_round -lt $MAX_REVIEW_ROUNDS ]] || break
+  cat > "$STATE_DIR/review-fix-prompt.md" <<FIXPROMPT
+You are a fresh implementation iteration addressing automatic review round $review_round for GitHub issue #$ISSUE.
+Read .ralph/issue.md, repository instructions such as AGENTS.md, .ralph/progress.md if present, recent Git history, the current diff, and the review report at .ralph/reviews/round-$review_round.md.
+Investigate every finding. Fix actionable problems with focused tests. If a finding is incorrect, record a concise evidence-based explanation instead of changing correct code.
+Run focused checks, commit a coherent passing change, append durable notes to .ralph/progress.md, and write a concise response to .ralph/reviews/response-$review_round.md describing how each finding was handled.
+Do not use gh, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested.
+FIXPROMPT
+  log "Fixing review round $review_round"
+  set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/review-fix-prompt.md)\"") 2>&1 | tee "$fix_log" | tee -a "$RUN_LOG"; fix_rc=${PIPESTATUS[0]}; set -e
+  [[ $fix_rc -eq 0 ]] || die "Agent failed while fixing review round $review_round"
+  write_issue
+  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+  [[ $verify_rc -eq 0 ]] || die "Verification failed after review round $review_round fixes"
+  commit_pending "Address review round $review_round for issue #$ISSUE"
+ done
+ [[ $review_approved -eq 1 ]] || die "Automatic review was not approved after $MAX_REVIEW_ROUNDS rounds"
+ set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+ [[ $verify_rc -eq 0 ]] || die "Final verification failed after automatic review"
+ review_summary="Passed after $review_round round(s)."
+fi
 if [[ $OPEN_PR -eq 0 ]]; then gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; KEEP_WORKTREE=1; trap - EXIT; log "Verified; kept $WORKTREE"; exit 0; fi
 git -C "$WORKTREE" push -u origin "$BRANCH"
 cat > "$STATE_DIR/pr-body.md" <<PRBODY
@@ -105,6 +152,9 @@ $VERIFY_CMD
 \`\`\`
 
 The command passed before this draft PR was opened.
+
+## Automatic review
+$review_summary
 
 ## Review guidance
 Please verify scope, correctness, tests, compatibility, and security. This PR is never merged automatically.

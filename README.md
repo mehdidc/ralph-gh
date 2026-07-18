@@ -22,7 +22,10 @@ run deterministic verification
         |
         +-- failure --> refresh context and start a fresh iteration
         |
-        +-- success --> push branch --> open draft PR --> request human review
+        +-- success --> optional automatic review/fix rounds
+                              |
+                              v
+                      push branch --> open draft PR --> request human review
 ```
 
 When `ralph-gh run` starts, the controller checks that the issue is ready,
@@ -44,12 +47,13 @@ whether the issue is finished. If it fails, the controller refreshes the issue
 and comments before launching another fresh agent process, up to the configured
 iteration limit.
 
-After verification passes, the controller commits any remaining tracked work,
-pushes the branch, and opens a draft PR. It replaces `ralph-running` with
-`ralph-review` and requests the configured reviewer. The PR is never merged
-automatically. If the run exits unsuccessfully, the issue is labeled
-`ralph-failed` so it can be inspected and returned to `ralph-ready` for another
-attempt.
+After verification passes, the controller commits any remaining tracked work.
+If automatic review is configured, it runs the bounded review/fix loop before
+pushing; otherwise it proceeds immediately. It then pushes the branch, opens a
+draft PR, replaces `ralph-running` with `ralph-review`, and requests the
+configured reviewer. The PR is never merged automatically. If the run exits
+unsuccessfully, the issue is labeled `ralph-failed` so it can be inspected and
+returned to `ralph-ready` for another attempt.
 
 ## Requirements
 
@@ -124,6 +128,35 @@ test non-interactive mode in the target repository:
 claude --print 'Inspect this repository and exit without making changes.'
 ```
 
+### Optional automatic review
+
+Automatic review is disabled by default. To review the verified changes before
+the branch is pushed, configure a second non-interactive agent command:
+
+```bash
+export RALPH_REVIEW_AGENT_CMD='codex exec --sandbox read-only'
+export RALPH_MAX_REVIEW_ROUNDS=3
+```
+
+The reviewer gets a read-only prompt and either reports actionable findings or
+ends with `RALPH_REVIEW_APPROVED`. When it reports findings, a fresh
+implementation agent addresses them, verification runs again, and another
+fresh reviewer checks the result. The branch is pushed only after approval and
+a final successful verification. The run fails if review is not approved
+within the configured number of rounds.
+
+The equivalent command-line options are:
+
+```bash
+ralph-gh run 42 \
+  --review-agent-cmd 'codex exec --sandbox read-only' \
+  --max-review-rounds 3
+```
+
+Use `--no-review` to disable automatic review for one run even when
+`RALPH_REVIEW_AGENT_CMD` is set. Human review of the resulting draft PR is
+still required whether or not automatic review is enabled.
+
 Deterministic completion is mandatory:
 
 ```bash
@@ -162,5 +195,5 @@ The controller owns `gh`. It removes `GH_TOKEN`, `GITHUB_TOKEN`, and `GITHUB_PAT
 - Local checkout required.
 - One shell verification command.
 - No daemon or atomic multi-worker claim yet.
-- No automatic PR-review feedback loop yet.
+- No automatic feedback loop for review comments posted after the PR opens.
 - Agent CLI conventions differ, so configure `RALPH_AGENT_CMD`.
