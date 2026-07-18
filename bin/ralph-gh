@@ -102,6 +102,7 @@ cat > "$STATE_DIR/prompt.md" <<'PROMPT'
 You are one fresh iteration of a Ralph-style coding loop.
 Read `.ralph/issue.md`, repository instruction files such as `AGENTS.md`, `.ralph/progress.md` if present, recent git history, and the current diff.
 Make the smallest coherent step toward resolving the issue. Inspect before editing. Implement real code/tests/docs. Run focused checks. Commit a coherent passing step. Append concise durable notes to `.ralph/progress.md` with changes, commands, failures, and the best next step.
+Create or update `.ralph/pr-summary.md` with a concise, user-facing bullet list of what the branch now implements. Describe actual behavior and tests in the complete diff, not the process, intentions, or iteration history. Do not include a heading because the runner adds it.
 Do not use `gh`, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested. The outer runner decides completion with deterministic verification.
 PROMPT
 : > "$RUN_LOG"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$READY_LABEL" --remove-label "$FAILED_LABEL" --add-label "$RUNNING_LABEL" >/dev/null
@@ -143,6 +144,7 @@ You are a fresh implementation iteration addressing automatic review round $revi
 Read .ralph/issue.md, repository instructions such as AGENTS.md, .ralph/progress.md if present, recent Git history, the current diff, and the review report at .ralph/reviews/round-$review_round.md.
 Investigate every finding. Fix actionable problems with focused tests. If a finding is incorrect, record a concise evidence-based explanation instead of changing correct code.
 Run focused checks, commit a coherent passing change, append durable notes to .ralph/progress.md, and write a concise response to .ralph/reviews/response-$review_round.md describing how each finding was handled.
+Update .ralph/pr-summary.md so it accurately describes the complete branch after your fixes. Keep it as a concise, user-facing bullet list without a heading.
 Do not use gh, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested.
 FIXPROMPT
   log "Fixing review round $review_round"
@@ -160,11 +162,24 @@ FIXPROMPT
 fi
 if [[ $OPEN_PR -eq 0 ]]; then gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; KEEP_WORKTREE=1; trap - EXIT; log "Verified; kept $WORKTREE"; exit 0; fi
 git -C "$WORKTREE" push -u origin "$BRANCH"
+if [[ -s "$STATE_DIR/pr-summary.md" ]]; then
+ pr_summary=$(<"$STATE_DIR/pr-summary.md")
+else
+ pr_summary=$(git -C "$WORKTREE" log --reverse --format='- %s' "origin/$BASE..HEAD")
+ [[ -n "$pr_summary" ]] || pr_summary="- Resolve issue #$ISSUE: $TITLE"
+fi
+change_summary=$(git -C "$WORKTREE" diff --stat "origin/$BASE...HEAD")
+[[ -n "$change_summary" ]] || change_summary="No file changes."
 cat > "$STATE_DIR/pr-body.md" <<PRBODY
 Closes #$ISSUE
 
 ## Summary
-Implemented by a Ralph-style loop using issue #$ISSUE as the specification and Git history as persistent state.
+$pr_summary
+
+## Changed files
+<pre>
+$change_summary
+</pre>
 
 ## Verification
 \`\`\`sh

@@ -47,13 +47,20 @@ whether the issue is finished. If it fails, the controller refreshes the issue
 and comments before launching another fresh agent process, up to the configured
 iteration limit.
 
-After verification passes, the controller commits any remaining tracked work.
+During implementation, the agent maintains `.ralph/pr-summary.md` from the
+actual completed diff. After verification passes, the controller commits any
+remaining tracked work.
 If automatic review is configured, it runs the bounded review/fix loop before
 pushing; otherwise it proceeds immediately. It then pushes the branch, opens a
 draft PR, replaces `ralph-running` with `ralph-review`, and requests the
 configured reviewer. The PR is never merged automatically. If the run exits
 unsuccessfully, the issue is labeled `ralph-failed` so it can be inspected and
 returned to `ralph-ready` for another attempt.
+
+The draft PR body contains the agent's final implementation summary, the actual
+Git diff stat, the configured verification command, and automatic-review
+status. If the agent did not produce a summary, commit subjects from the branch
+are used as a deterministic fallback.
 
 ## Requirements
 
