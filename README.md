@@ -2,17 +2,54 @@
 
 A minimal GitHub-native Ralph loop. GitHub issues replace PRD JSON files; labels form the queue/state machine; issue comments allow live human steering; fresh agent processes prevent context rot; Git commits and `.ralph/progress.md` retain memory.
 
-## Flow
+## Workflow
+
+The GitHub issue is the specification: there is no separate PRD JSON file. Labels
+form a small state machine, while Git commits and `.ralph/progress.md` carry state
+between otherwise fresh agent processes.
 
 ```text
 ralph-ready issue
-  -> isolated git worktree
-  -> fresh agent iteration
-  -> deterministic verification
-  -> repeat if failing
-  -> push branch
-  -> draft PR + human review
+        |
+        v
+create isolated worktree on ralph/issue-<number>
+        |
+        v
+run a fresh agent process for one iteration
+        |
+        v
+run deterministic verification
+        |
+        +-- failure --> refresh context and start a fresh iteration
+        |
+        +-- success --> push branch --> open draft PR --> request human review
 ```
+
+When `ralph-gh run` starts, the controller checks that the issue is ready,
+changes its label from `ralph-ready` to `ralph-running`, and creates an isolated
+worktree from the selected base branch. The working branch is named
+`ralph/issue-<number>`.
+
+For each iteration, a new agent process reads:
+
+- the current issue body and all issue comments from `.ralph/issue.md`;
+- repository instructions such as `AGENTS.md`;
+- durable notes left in `.ralph/progress.md`;
+- recent Git history and the current diff.
+
+The agent makes a small coherent change, runs focused checks, commits its work,
+and records useful context for the next iteration. The controller then runs
+`RALPH_VERIFY_CMD`. This command—not an agent message such as `COMPLETE`—decides
+whether the issue is finished. If it fails, the controller refreshes the issue
+and comments before launching another fresh agent process, up to the configured
+iteration limit.
+
+After verification passes, the controller commits any remaining tracked work,
+pushes the branch, and opens a draft PR. It replaces `ralph-running` with
+`ralph-review` and requests the configured reviewer. The PR is never merged
+automatically. If the run exits unsuccessfully, the issue is labeled
+`ralph-failed` so it can be inspected and returned to `ralph-ready` for another
+attempt.
 
 ## Requirements
 
