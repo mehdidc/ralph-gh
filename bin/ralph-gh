@@ -7,6 +7,7 @@ usage(){ cat <<'USAGE'
 Usage:
   ralph-gh run <issue-number> [options]
   ralph-gh next [options]
+  ralph-gh daemon [options]
   ralph-gh status <issue-number> [--repo OWNER/REPO]
   ralph-gh labels [--repo OWNER/REPO]
 
@@ -17,6 +18,7 @@ Options:
   --review-agent-cmd CMD
   --max-review-rounds N
   --no-review
+  --poll-interval SECONDS
   --verify-cmd CMD
   --base BRANCH
   --reviewer USER
@@ -29,19 +31,37 @@ need git; need gh; need jq
 COMMAND=${1:-}; [[ -n "$COMMAND" ]] || { usage; exit 2; }; shift || true
 ISSUE=""
 if [[ "$COMMAND" == run || "$COMMAND" == status ]]; then ISSUE=${1:-}; [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "Issue number required"; shift; fi
-REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}
+REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; REVIEW_DISABLED=0; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; POLL_INTERVAL=${RALPH_POLL_INTERVAL:-60}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}
 READY_LABEL=${RALPH_READY_LABEL:-ralph-ready}; RUNNING_LABEL=${RALPH_RUNNING_LABEL:-ralph-running}; REVIEW_LABEL=${RALPH_REVIEW_LABEL:-ralph-review}; FAILED_LABEL=${RALPH_FAILED_LABEL:-ralph-failed}
 BASE=""; REVIEWER=${RALPH_REVIEWER:-}; OPEN_PR=1; COMMENTS=1; KEEP_WORKTREE=0; WORK_ROOT=${RALPH_WORK_ROOT:-${TMPDIR:-/tmp}/ralph-gh}
 while [[ $# -gt 0 ]]; do
  case "$1" in
   --repo) REPO=$2; shift 2;; --max-iterations) MAX_ITERATIONS=$2; shift 2;; --agent-cmd) AGENT_CMD=$2; shift 2;;
-  --review-agent-cmd) REVIEW_AGENT_CMD=$2; shift 2;; --max-review-rounds) MAX_REVIEW_ROUNDS=$2; shift 2;; --no-review) REVIEW_AGENT_CMD=""; shift;; --verify-cmd) VERIFY_CMD=$2; shift 2;;
+  --review-agent-cmd) REVIEW_AGENT_CMD=$2; REVIEW_DISABLED=0; shift 2;; --max-review-rounds) MAX_REVIEW_ROUNDS=$2; shift 2;; --no-review) REVIEW_AGENT_CMD=""; REVIEW_DISABLED=1; shift;;
+  --poll-interval) POLL_INTERVAL=$2; shift 2;; --verify-cmd) VERIFY_CMD=$2; shift 2;;
   --base) BASE=$2; shift 2;; --reviewer) REVIEWER=$2; shift 2;; --no-pr) OPEN_PR=0; shift;; --no-comments) COMMENTS=0; shift;; --keep-worktree) KEEP_WORKTREE=1; shift;;
   -h|--help) usage; exit 0;; *) die "Unknown option: $1";;
  esac
 done
 [[ -n "$REPO" ]] || REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) || die "Pass --repo or run inside a GitHub checkout"
 repo_json=$(gh repo view "$REPO" --json defaultBranchRef,url); DEFAULT_BRANCH=$(jq -r '.defaultBranchRef.name' <<<"$repo_json"); BASE=${BASE:-$DEFAULT_BRANCH}
+if [[ "$COMMAND" == daemon ]]; then
+ [[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ -n "$VERIFY_CMD" ]] || die "Set RALPH_VERIFY_CMD or --verify-cmd"
+ [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"; [[ "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "Bad poll interval"
+ [[ -z "$REVIEW_AGENT_CMD" || "$MAX_REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "Bad review round count"
+ if [[ "$0" == */* ]]; then SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0"); else SELF=$(command -v "$0"); fi
+ daemon_args=(--repo "$REPO" --max-iterations "$MAX_ITERATIONS" --agent-cmd "$AGENT_CMD" --verify-cmd "$VERIFY_CMD" --base "$BASE")
+ if [[ -n "$REVIEW_AGENT_CMD" ]]; then daemon_args+=(--review-agent-cmd "$REVIEW_AGENT_CMD" --max-review-rounds "$MAX_REVIEW_ROUNDS"); elif [[ $REVIEW_DISABLED -eq 1 ]]; then daemon_args+=(--no-review); fi
+ [[ -z "$REVIEWER" ]] || daemon_args+=(--reviewer "$REVIEWER"); [[ $OPEN_PR -eq 1 ]] || daemon_args+=(--no-pr); [[ $COMMENTS -eq 1 ]] || daemon_args+=(--no-comments); [[ $KEEP_WORKTREE -eq 0 ]] || daemon_args+=(--keep-worktree)
+ trap 'log "Daemon stopping"; exit 0' INT TERM
+ log "Daemon watching $REPO every ${POLL_INTERVAL}s"
+ while true; do
+  if ! daemon_issue=$(gh issue list -R "$REPO" --state open --label "$READY_LABEL" --limit 100 --json number,createdAt --jq 'sort_by(.createdAt) | .[0].number // empty'); then log "Could not read issue queue; retrying in ${POLL_INTERVAL}s"; sleep "$POLL_INTERVAL"; continue; fi
+  if [[ -z "$daemon_issue" ]]; then log "No issue labeled $READY_LABEL; checking again in ${POLL_INTERVAL}s"; sleep "$POLL_INTERVAL"; continue; fi
+  log "Claiming issue #$daemon_issue"
+  if ! "$SELF" run "$daemon_issue" "${daemon_args[@]}"; then log "Issue #$daemon_issue failed; continuing in ${POLL_INTERVAL}s"; sleep "$POLL_INTERVAL"; fi
+ done
+fi
 ensure_label(){ gh label create "$1" -R "$REPO" --color "$2" --description "$3" 2>/dev/null || true; }
 create_labels(){ ensure_label "$READY_LABEL" 0E8A16 "Approved for Ralph execution"; ensure_label "$RUNNING_LABEL" FBCA04 "Ralph is working"; ensure_label "$REVIEW_LABEL" 1D76DB "Draft PR ready for review"; ensure_label "$FAILED_LABEL" B60205 "Ralph failed"; }
 if [[ "$COMMAND" == labels ]]; then create_labels; log "Labels ready"; exit 0; fi

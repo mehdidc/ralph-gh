@@ -175,6 +175,34 @@ ralph-gh next --reviewer YOUR_GITHUB_LOGIN
 ralph-gh status 42
 ```
 
+## Daemon
+
+Run a sequential worker that continuously processes the oldest
+`ralph-ready` issue:
+
+```bash
+ralph-gh daemon --reviewer YOUR_GITHUB_LOGIN
+```
+
+The daemon runs one issue at a time using the normal `run` workflow. After a
+run succeeds, it immediately claims the next ready issue. If an issue fails,
+the normal failure handling labels it `ralph-failed`; the daemon waits for the
+poll interval and continues watching the queue. When no issue is ready, it
+waits 60 seconds by default before checking again.
+
+Configure the interval with an environment variable or command-line option:
+
+```bash
+export RALPH_POLL_INTERVAL=30
+ralph-gh daemon --poll-interval 30
+```
+
+All normal execution options are supported, including `--agent-cmd`,
+`--verify-cmd`, `--max-iterations`, optional automatic review settings,
+`--no-pr`, and `--keep-worktree`. Stop the daemon with `Ctrl-C` or send it
+`SIGTERM`. The daemon is a single sequential worker; claiming issues is not
+atomic across multiple daemon processes.
+
 ## Labels
 
 - `ralph-ready`
@@ -194,6 +222,6 @@ The controller owns `gh`. It removes `GH_TOKEN`, `GITHUB_TOKEN`, and `GITHUB_PAT
 
 - Local checkout required.
 - One shell verification command.
-- No daemon or atomic multi-worker claim yet.
+- No atomic multi-worker claim yet; run only one daemon per repository.
 - No automatic feedback loop for review comments posted after the PR opens.
 - Agent CLI conventions differ, so configure `RALPH_AGENT_CMD`.
