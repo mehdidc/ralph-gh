@@ -18,7 +18,7 @@ create isolated worktree on ralph/issue-<number>
 run a fresh agent process for one iteration
         |
         v
-run deterministic verification
+run verification (if configured)
         |
         +-- failure --> refresh context and start a fresh iteration
         |
@@ -41,15 +41,16 @@ For each iteration, a new agent process reads:
 - recent Git history and the current diff.
 
 The agent makes a small coherent change, runs focused checks, commits its work,
-and records useful context for the next iteration. The controller then runs
-`RALPH_VERIFY_CMD`. This command—not an agent message such as `COMPLETE`—decides
-whether the issue is finished. If it fails, the controller refreshes the issue
-and comments before launching another fresh agent process, up to the configured
-iteration limit.
+and records useful context for the next iteration. When `RALPH_VERIFY_CMD` is
+configured, that command—not an agent message such as `COMPLETE`—decides whether
+the issue is finished. If it fails, the controller refreshes the issue and
+comments before launching another fresh agent process, up to the configured
+iteration limit. Without a verification command, a successful agent exit ends
+the implementation loop; nonzero exits are retried up to the same limit.
 
 During implementation, the agent maintains `.ralph/pr-summary.md` from the
-actual completed diff. After verification passes, the controller commits any
-remaining tracked work.
+actual completed diff. After the implementation loop completes, the controller
+commits any remaining tracked work.
 If automatic review is configured, it runs the bounded review/fix loop before
 pushing; otherwise it proceeds immediately. It then pushes the branch, opens a
 draft PR, replaces `ralph-running` with `ralph-review`, and requests the
@@ -147,10 +148,10 @@ export RALPH_MAX_REVIEW_ROUNDS=3
 
 The reviewer gets a read-only prompt and either reports actionable findings or
 ends with `RALPH_REVIEW_APPROVED`. When it reports findings, a fresh
-implementation agent addresses them, verification runs again, and another
-fresh reviewer checks the result. The branch is pushed only after approval and
-a final successful verification. The run fails if review is not approved
-within the configured number of rounds.
+implementation agent addresses them, configured verification runs again, and
+another fresh reviewer checks the result. The branch is pushed only after
+approval and a final successful verification when configured. The run fails if
+review is not approved within the configured number of rounds.
 
 The equivalent command-line options are:
 
@@ -164,11 +165,14 @@ Use `--no-review` to disable automatic review for one run even when
 `RALPH_REVIEW_AGENT_CMD` is set. Human review of the resulting draft PR is
 still required whether or not automatic review is enabled.
 
-Deterministic completion is mandatory:
+Deterministic verification is optional but recommended:
 
 ```bash
 export RALPH_VERIFY_CMD='uv run ruff check . && uv run pytest -q'
 ```
+
+Leave `RALPH_VERIFY_CMD` unset to use the agent's exit status, or pass
+`--no-verify` to disable an inherited verification command for one run.
 
 ## Run
 
@@ -233,7 +237,7 @@ logs are not copied into the comment because they may contain secrets.
 ## MVP limitations
 
 - Local checkout required.
-- One shell verification command.
+- At most one optional shell verification command.
 - No atomic multi-worker claim yet; run only one daemon per repository.
 - No automatic feedback loop for review comments posted after the PR opens.
 - Agent CLI conventions differ, so configure `RALPH_AGENT_CMD`.

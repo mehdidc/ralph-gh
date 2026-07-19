@@ -21,6 +21,7 @@ Options:
   --no-review
   --poll-interval SECONDS
   --verify-cmd CMD
+  --no-verify
   --base BRANCH
   --reviewer USER
   --no-pr
@@ -32,14 +33,14 @@ need git; need gh; need jq
 COMMAND=${1:-}; [[ -n "$COMMAND" ]] || { usage; exit 2; }; shift || true
 ISSUE=""
 if [[ "$COMMAND" == run || "$COMMAND" == status ]]; then ISSUE=${1:-}; [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "Issue number required"; shift; fi
-REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; REVIEW_DISABLED=0; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; POLL_INTERVAL=${RALPH_POLL_INTERVAL:-60}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}
+REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; REVIEW_DISABLED=0; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; POLL_INTERVAL=${RALPH_POLL_INTERVAL:-60}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}; VERIFY_DISABLED=0
 READY_LABEL=${RALPH_READY_LABEL:-ralph-ready}; RUNNING_LABEL=${RALPH_RUNNING_LABEL:-ralph-running}; REVIEW_LABEL=${RALPH_REVIEW_LABEL:-ralph-review}; FAILED_LABEL=${RALPH_FAILED_LABEL:-ralph-failed}
 BASE=""; REVIEWER=${RALPH_REVIEWER:-}; OPEN_PR=1; COMMENTS=1; KEEP_WORKTREE=0; WORK_ROOT=${RALPH_WORK_ROOT:-${TMPDIR:-/tmp}/ralph-gh}
 while [[ $# -gt 0 ]]; do
  case "$1" in
   --repo) REPO=$2; shift 2;; --max-iterations) MAX_ITERATIONS=$2; shift 2;; --agent-cmd) AGENT_CMD=$2; shift 2;;
   --review-agent-cmd) REVIEW_AGENT_CMD=$2; REVIEW_DISABLED=0; shift 2;; --max-review-rounds) MAX_REVIEW_ROUNDS=$2; shift 2;; --no-review) REVIEW_AGENT_CMD=""; REVIEW_DISABLED=1; shift;;
-  --poll-interval) POLL_INTERVAL=$2; shift 2;; --verify-cmd) VERIFY_CMD=$2; shift 2;;
+  --poll-interval) POLL_INTERVAL=$2; shift 2;; --verify-cmd) VERIFY_CMD=$2; VERIFY_DISABLED=0; shift 2;; --no-verify) VERIFY_CMD=""; VERIFY_DISABLED=1; shift;;
   --base) BASE=$2; shift 2;; --reviewer) REVIEWER=$2; shift 2;; --no-pr) OPEN_PR=0; shift;; --no-comments) COMMENTS=0; shift;; --keep-worktree) KEEP_WORKTREE=1; shift;;
   -h|--help) usage; exit 0;; *) die "Unknown option: $1";;
  esac
@@ -47,11 +48,12 @@ done
 [[ -n "$REPO" ]] || REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) || die "Pass --repo or run inside a GitHub checkout"
 repo_json=$(gh repo view "$REPO" --json defaultBranchRef,url); DEFAULT_BRANCH=$(jq -r '.defaultBranchRef.name' <<<"$repo_json"); BASE=${BASE:-$DEFAULT_BRANCH}
 if [[ "$COMMAND" == daemon ]]; then
- [[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ -n "$VERIFY_CMD" ]] || die "Set RALPH_VERIFY_CMD or --verify-cmd"
+ [[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"
  [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"; [[ "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "Bad poll interval"
  [[ -z "$REVIEW_AGENT_CMD" || "$MAX_REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "Bad review round count"
  if [[ "$0" == */* ]]; then SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0"); else SELF=$(command -v "$0"); fi
- daemon_args=(--repo "$REPO" --max-iterations "$MAX_ITERATIONS" --agent-cmd "$AGENT_CMD" --verify-cmd "$VERIFY_CMD" --base "$BASE")
+ daemon_args=(--repo "$REPO" --max-iterations "$MAX_ITERATIONS" --agent-cmd "$AGENT_CMD" --base "$BASE")
+ if [[ -n "$VERIFY_CMD" ]]; then daemon_args+=(--verify-cmd "$VERIFY_CMD"); elif [[ $VERIFY_DISABLED -eq 1 ]]; then daemon_args+=(--no-verify); fi
  if [[ -n "$REVIEW_AGENT_CMD" ]]; then daemon_args+=(--review-agent-cmd "$REVIEW_AGENT_CMD" --max-review-rounds "$MAX_REVIEW_ROUNDS"); elif [[ $REVIEW_DISABLED -eq 1 ]]; then daemon_args+=(--no-review); fi
  [[ -z "$REVIEWER" ]] || daemon_args+=(--reviewer "$REVIEWER"); [[ $OPEN_PR -eq 1 ]] || daemon_args+=(--no-pr); [[ $COMMENTS -eq 1 ]] || daemon_args+=(--no-comments); [[ $KEEP_WORKTREE -eq 0 ]] || daemon_args+=(--keep-worktree)
  trap 'log "Daemon stopping"; exit 0' INT TERM
@@ -71,7 +73,7 @@ issue_json=$(gh issue view "$ISSUE" -R "$REPO" --json number,title,body,url,stat
 TITLE=$(jq -r .title <<<"$issue_json"); ISSUE_URL=$(jq -r .url <<<"$issue_json"); BRANCH="ralph/issue-$ISSUE"
 if [[ "$COMMAND" == status ]]; then printf 'Repository: %s\nIssue: #%s %s\nURL: %s\nBranch: %s\n' "$REPO" "$ISSUE" "$TITLE" "$ISSUE_URL" "$BRANCH"; gh pr list -R "$REPO" --head "$BRANCH" --state all --json number,state,isDraft,url --jq '.[] | "PR #\(.number) [\(.state)] draft=\(.isDraft) \(.url)"'; exit 0; fi
 [[ "$COMMAND" == run || "$COMMAND" == next ]] || die "Unknown command"
-[[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ -n "$VERIFY_CMD" ]] || die "Set RALPH_VERIFY_CMD or --verify-cmd"; [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"
+[[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"
 [[ -z "$REVIEW_AGENT_CMD" || "$MAX_REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "Bad review round count"
 create_labels
 labels=$(jq -r '.labels[].name' <<<"$issue_json"); { grep -Fxq "$READY_LABEL" <<<"$labels" || grep -Fxq "$RUNNING_LABEL" <<<"$labels"; } || die "Issue needs $READY_LABEL"
@@ -116,7 +118,7 @@ You are one fresh iteration of a Ralph-style coding loop.
 Read `.ralph/issue.md`, repository instruction files such as `AGENTS.md`, `.ralph/progress.md` if present, recent git history, and the current diff.
 Make the smallest coherent step toward resolving the issue. Inspect before editing. Implement real code/tests/docs. Run focused checks. Commit a coherent passing step. Append concise durable notes to `.ralph/progress.md` with changes, commands, failures, and the best next step.
 Create or update `.ralph/pr-summary.md` with a concise, user-facing bullet list of what the branch now implements. Describe actual behavior and tests in the complete diff, not the process, intentions, or iteration history. Do not include a heading because the runner adds it.
-Do not use `gh`, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested. The outer runner decides completion with deterministic verification.
+Do not use `gh`, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested. When configured, the outer runner decides completion with deterministic verification.
 PROMPT
 : > "$RUN_LOG"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$READY_LABEL" --remove-label "$FAILED_LABEL" --add-label "$RUNNING_LABEL" >/dev/null
 [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph started branch \`$BRANCH\` with up to $MAX_ITERATIONS fresh iterations." >/dev/null
@@ -126,11 +128,14 @@ for ((i=1;i<=MAX_ITERATIONS;i++)); do
  log "Iteration $i/$MAX_ITERATIONS"; printf '\n===== ITERATION %s =====\n' "$i" >> "$RUN_LOG"
  set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/prompt.md)\"") 2>&1 | tee -a "$RUN_LOG"; agent_rc=${PIPESTATUS[0]}; set -e; log "Agent exit: $agent_rc"
  write_issue
- CURRENT_STAGE="verification after iteration $i/$MAX_ITERATIONS"
- set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
- if [[ $verify_rc -eq 0 ]]; then verified=1; break; fi
+ if [[ -n "$VERIFY_CMD" ]]; then
+  CURRENT_STAGE="verification after iteration $i/$MAX_ITERATIONS"
+  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+  if [[ $verify_rc -eq 0 ]]; then verified=1; break; fi
+ elif [[ $agent_rc -eq 0 ]]; then verified=1; break
+ fi
 done
-[[ $verified -eq 1 ]] || die "Verification failed after $MAX_ITERATIONS iterations"
+if [[ $verified -ne 1 ]]; then if [[ -n "$VERIFY_CMD" ]]; then die "Verification failed after $MAX_ITERATIONS iterations"; else die "Agent failed after $MAX_ITERATIONS iterations without a verification command"; fi; fi
 commit_pending(){ if ! git -C "$WORKTREE" diff --quiet || ! git -C "$WORKTREE" diff --cached --quiet; then git -C "$WORKTREE" add -A; git -C "$WORKTREE" reset -- .ralph >/dev/null 2>&1 || true; git -C "$WORKTREE" diff --cached --quiet || git -C "$WORKTREE" commit -m "$1"; fi; }
 commit_pending "Complete issue #$ISSUE"
 review_summary="Disabled."
@@ -168,18 +173,22 @@ FIXPROMPT
   set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/review-fix-prompt.md)\"") 2>&1 | tee "$fix_log" | tee -a "$RUN_LOG"; fix_rc=${PIPESTATUS[0]}; set -e
   [[ $fix_rc -eq 0 ]] || die "Agent failed while fixing review round $review_round"
   write_issue
-  CURRENT_STAGE="verification after review round $review_round fixes"
-  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
-  [[ $verify_rc -eq 0 ]] || die "Verification failed after review round $review_round fixes"
+  if [[ -n "$VERIFY_CMD" ]]; then
+   CURRENT_STAGE="verification after review round $review_round fixes"
+   set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+   [[ $verify_rc -eq 0 ]] || die "Verification failed after review round $review_round fixes"
+  fi
   commit_pending "Address review round $review_round for issue #$ISSUE"
  done
  [[ $review_approved -eq 1 ]] || die "Automatic review was not approved after $MAX_REVIEW_ROUNDS rounds"
- CURRENT_STAGE="final verification after automatic review"
- set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
- [[ $verify_rc -eq 0 ]] || die "Final verification failed after automatic review"
+ if [[ -n "$VERIFY_CMD" ]]; then
+  CURRENT_STAGE="final verification after automatic review"
+  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+  [[ $verify_rc -eq 0 ]] || die "Final verification failed after automatic review"
+ fi
  review_summary="Passed after $review_round round(s)."
 fi
-if [[ $OPEN_PR -eq 0 ]]; then CURRENT_STAGE="marking issue ready for review"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; KEEP_WORKTREE=1; trap - EXIT; log "Verified; kept $WORKTREE"; exit 0; fi
+if [[ $OPEN_PR -eq 0 ]]; then CURRENT_STAGE="marking issue ready for review"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; KEEP_WORKTREE=1; trap - EXIT; log "Completed; kept $WORKTREE"; exit 0; fi
 CURRENT_STAGE="pushing branch $BRANCH"
 git -C "$WORKTREE" push -u origin "$BRANCH"
 if [[ -s "$STATE_DIR/pr-summary.md" ]]; then
@@ -190,6 +199,13 @@ else
 fi
 change_summary=$(git -C "$WORKTREE" diff --stat "origin/$BASE...HEAD")
 [[ -n "$change_summary" ]] || change_summary="No file changes."
+if [[ -n "$VERIFY_CMD" ]]; then
+ printf -v verification_summary '```sh\n%s\n```\n\nThe command passed before this draft PR was opened.' "$VERIFY_CMD"
+ completion_description="verified draft PR"
+else
+ verification_summary="No verification command was configured. Completion was based on a successful agent exit status."
+ completion_description="draft PR without deterministic verification"
+fi
 cat > "$STATE_DIR/pr-body.md" <<PRBODY
 Closes #$ISSUE
 
@@ -202,11 +218,7 @@ $change_summary
 </pre>
 
 ## Verification
-\`\`\`sh
-$VERIFY_CMD
-\`\`\`
-
-The command passed before this draft PR was opened.
+$verification_summary
 
 ## Automatic review
 $review_summary
@@ -216,5 +228,5 @@ Please verify scope, correctness, tests, compatibility, and security. This PR is
 PRBODY
 CURRENT_STAGE="creating the draft pull request"
 args=(--repo "$REPO" --base "$BASE" --head "$BRANCH" --draft --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md"); [[ -z "$REVIEWER" ]] || args+=(--reviewer "$REVIEWER"); PR_URL=$(cd "$WORKTREE" && gh pr create "${args[@]}")
-gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph opened a verified draft PR: $PR_URL" >/dev/null
+gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph opened a $completion_description: $PR_URL" >/dev/null
 log "Draft PR: $PR_URL"; trap - EXIT; if [[ $KEEP_WORKTREE -eq 0 ]]; then git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE"; else log "Kept worktree: $WORKTREE"; fi
