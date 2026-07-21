@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-FAILURE_REASON=""; CURRENT_STAGE="initialization"
+FAILURE_REASON=""; FAILURE_DETAILS=""; CURRENT_STAGE="initialization"
 log(){ printf '[ralph-gh] %s\n' "$*" >&2; }
 die(){ FAILURE_REASON="$*"; log "ERROR: $*"; exit 1; }
+set_failure_details(){
+ local source=$1
+ [[ -f "$source" ]] || return 0
+ FAILURE_DETAILS=$(tail -n 20 "$source" | sed -E 's#(https?://)[^/@[:space:]]+@#\1***@#g; s/(gh[pousr]_[A-Za-z0-9_]{10,})/[REDACTED]/g; s/(github_pat_[A-Za-z0-9_]+)/[REDACTED]/g')
+}
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 usage(){ cat <<'USAGE'
 Usage:
@@ -80,11 +85,12 @@ labels=$(jq -r '.labels[].name' <<<"$issue_json"); { grep -Fxq "$READY_LABEL" <<
 existing=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty'); [[ -z "$existing" ]] || die "Open PR already exists: $existing"
 ORIGINAL_REPO=$(git rev-parse --show-toplevel); SLUG=${REPO//\//-}; WORKTREE="$WORK_ROOT/$SLUG-issue-$ISSUE"; STATE_DIR="$WORKTREE/.ralph"; RUN_LOG="$STATE_DIR/run.log"
 cleanup(){
- local rc=$? failure_comment retained
+ local rc=$? failure_comment retained details_section="" formatted_details
  if [[ $rc -ne 0 ]]; then
   [[ -n "$FAILURE_REASON" ]] || FAILURE_REASON="The run exited with status $rc."
   if [[ $KEEP_WORKTREE -eq 1 ]]; then retained="The worktree was retained for inspection."; else retained="Inspect the daemon or controller output for the full log."; fi
-  printf -v failure_comment 'Ralph failed.\n\n- **Stage:** %s\n- **Reason:** %s\n- **Exit status:** %s\n\n%s\n\nAfter correcting the problem, reapply `%s` to retry.' "$CURRENT_STAGE" "$FAILURE_REASON" "$rc" "$retained" "$READY_LABEL"
+  if [[ -n "$FAILURE_DETAILS" ]]; then formatted_details=$(printf '%s\n' "$FAILURE_DETAILS" | sed 's/^/    /'); printf -v details_section '\n\n### Error output\n\n%s' "$formatted_details"; fi
+  printf -v failure_comment '## ❌ Ralph failed\n\n> [!CAUTION]\n> **Stage:** %s  \n> **Reason:** %s  \n> **Exit status:** `%s`%s\n\n%s\n\nAfter correcting the problem, reapply `%s` to retry.' "$CURRENT_STAGE" "$FAILURE_REASON" "$rc" "$details_section" "$retained" "$READY_LABEL"
   gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$FAILED_LABEL" >/dev/null 2>&1 || true
   [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "$failure_comment" >/dev/null 2>&1 || true
  fi
@@ -126,16 +132,18 @@ verified=0
 for ((i=1;i<=MAX_ITERATIONS;i++)); do
  CURRENT_STAGE="agent iteration $i/$MAX_ITERATIONS"
  log "Iteration $i/$MAX_ITERATIONS"; printf '\n===== ITERATION %s =====\n' "$i" >> "$RUN_LOG"
- set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/prompt.md)\"") 2>&1 | tee -a "$RUN_LOG"; agent_rc=${PIPESTATUS[0]}; set -e; log "Agent exit: $agent_rc"
+ agent_log="$STATE_DIR/agent-$i.log"
+ set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/prompt.md)\"") 2>&1 | tee "$agent_log" | tee -a "$RUN_LOG"; agent_rc=${PIPESTATUS[0]}; set -e; log "Agent exit: $agent_rc"
  write_issue
  if [[ -n "$VERIFY_CMD" ]]; then
   CURRENT_STAGE="verification after iteration $i/$MAX_ITERATIONS"
-  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+  verify_log="$STATE_DIR/verify.log"
+  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee "$verify_log" | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
   if [[ $verify_rc -eq 0 ]]; then verified=1; break; fi
  elif [[ $agent_rc -eq 0 ]]; then verified=1; break
  fi
 done
-if [[ $verified -ne 1 ]]; then if [[ -n "$VERIFY_CMD" ]]; then die "Verification failed after $MAX_ITERATIONS iterations"; else die "Agent failed after $MAX_ITERATIONS iterations without a verification command"; fi; fi
+if [[ $verified -ne 1 ]]; then if [[ -n "$VERIFY_CMD" ]]; then set_failure_details "$STATE_DIR/verify.log"; die "Verification failed after $MAX_ITERATIONS iterations"; else set_failure_details "$agent_log"; die "Agent failed after $MAX_ITERATIONS iterations without a verification command"; fi; fi
 commit_pending(){ if ! git -C "$WORKTREE" diff --quiet || ! git -C "$WORKTREE" diff --cached --quiet; then git -C "$WORKTREE" add -A; git -C "$WORKTREE" reset -- .ralph >/dev/null 2>&1 || true; git -C "$WORKTREE" diff --cached --quiet || git -C "$WORKTREE" commit -m "$1"; fi; }
 commit_pending "Complete issue #$ISSUE"
 review_summary="Disabled."
@@ -156,7 +164,7 @@ REVIEWPROMPT
   log "Review round $review_round/$MAX_REVIEW_ROUNDS"
   CURRENT_STAGE="automatic review round $review_round/$MAX_REVIEW_ROUNDS"
   set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$REVIEW_AGENT_CMD \"\$(cat .ralph/review-prompt.md)\"") 2>&1 | tee "$review_file" | tee -a "$RUN_LOG"; review_rc=${PIPESTATUS[0]}; set -e
-  [[ $review_rc -eq 0 ]] || die "Review agent failed in round $review_round"
+  if [[ $review_rc -ne 0 ]]; then set_failure_details "$review_file"; die "Review agent failed in round $review_round"; fi
   review_verdict=$(awk 'NF { line=$0 } END { print line }' "$review_file")
   if [[ "$review_verdict" == "RALPH_REVIEW_APPROVED" ]]; then review_approved=1; break; fi
   [[ $review_round -lt $MAX_REVIEW_ROUNDS ]] || break
@@ -171,26 +179,30 @@ FIXPROMPT
   log "Fixing review round $review_round"
   CURRENT_STAGE="fixing automatic review round $review_round/$MAX_REVIEW_ROUNDS"
   set +e; (cd "$WORKTREE" && env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_PAT bash -lc "$AGENT_CMD \"\$(cat .ralph/review-fix-prompt.md)\"") 2>&1 | tee "$fix_log" | tee -a "$RUN_LOG"; fix_rc=${PIPESTATUS[0]}; set -e
-  [[ $fix_rc -eq 0 ]] || die "Agent failed while fixing review round $review_round"
+  if [[ $fix_rc -ne 0 ]]; then set_failure_details "$fix_log"; die "Agent failed while fixing review round $review_round"; fi
   write_issue
   if [[ -n "$VERIFY_CMD" ]]; then
    CURRENT_STAGE="verification after review round $review_round fixes"
-   set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
-   [[ $verify_rc -eq 0 ]] || die "Verification failed after review round $review_round fixes"
+   verify_log="$STATE_DIR/verify.log"
+   set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee "$verify_log" | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+   if [[ $verify_rc -ne 0 ]]; then set_failure_details "$verify_log"; die "Verification failed after review round $review_round fixes"; fi
   fi
   commit_pending "Address review round $review_round for issue #$ISSUE"
  done
  [[ $review_approved -eq 1 ]] || die "Automatic review was not approved after $MAX_REVIEW_ROUNDS rounds"
  if [[ -n "$VERIFY_CMD" ]]; then
   CURRENT_STAGE="final verification after automatic review"
-  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
-  [[ $verify_rc -eq 0 ]] || die "Final verification failed after automatic review"
+  verify_log="$STATE_DIR/verify.log"
+  set +e; (cd "$WORKTREE" && bash -lc "$VERIFY_CMD") 2>&1 | tee "$verify_log" | tee -a "$RUN_LOG"; verify_rc=${PIPESTATUS[0]}; set -e
+  if [[ $verify_rc -ne 0 ]]; then set_failure_details "$verify_log"; die "Final verification failed after automatic review"; fi
  fi
  review_summary="Passed after $review_round round(s)."
 fi
 if [[ $OPEN_PR -eq 0 ]]; then CURRENT_STAGE="marking issue ready for review"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; KEEP_WORKTREE=1; trap - EXIT; log "Completed; kept $WORKTREE"; exit 0; fi
 CURRENT_STAGE="pushing branch $BRANCH"
-git -C "$WORKTREE" push -u origin "$BRANCH"
+push_log="$STATE_DIR/push.log"
+set +e; git -C "$WORKTREE" push -u origin "$BRANCH" 2>&1 | tee "$push_log" | tee -a "$RUN_LOG"; push_rc=${PIPESTATUS[0]}; set -e
+if [[ $push_rc -ne 0 ]]; then set_failure_details "$push_log"; die "Failed to push branch $BRANCH"; fi
 if [[ -s "$STATE_DIR/pr-summary.md" ]]; then
  pr_summary=$(<"$STATE_DIR/pr-summary.md")
 else
@@ -227,6 +239,11 @@ $review_summary
 Please verify scope, correctness, tests, compatibility, and security. This PR is never merged automatically.
 PRBODY
 CURRENT_STAGE="creating the draft pull request"
-args=(--repo "$REPO" --base "$BASE" --head "$BRANCH" --draft --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md"); [[ -z "$REVIEWER" ]] || args+=(--reviewer "$REVIEWER"); PR_URL=$(cd "$WORKTREE" && gh pr create "${args[@]}")
+args=(--repo "$REPO" --base "$BASE" --head "$BRANCH" --draft --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md"); [[ -z "$REVIEWER" ]] || args+=(--reviewer "$REVIEWER")
+pr_log="$STATE_DIR/pr-create.log"
+set +e; (cd "$WORKTREE" && gh pr create "${args[@]}") 2>&1 | tee "$pr_log" | tee -a "$RUN_LOG"; pr_rc=${PIPESTATUS[0]}; set -e
+if [[ $pr_rc -ne 0 ]]; then set_failure_details "$pr_log"; die "Failed to create the draft pull request"; fi
+PR_URL=$(grep -Eo 'https?://[^[:space:]]+/pull/[0-9]+' "$pr_log" | tail -n 1 || true)
+if [[ -z "$PR_URL" ]]; then set_failure_details "$pr_log"; die "Draft pull request was created but its URL could not be determined"; fi
 gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph opened a $completion_description: $PR_URL" >/dev/null
 log "Draft PR: $PR_URL"; trap - EXIT; if [[ $KEEP_WORKTREE -eq 0 ]]; then git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE"; else log "Kept worktree: $WORKTREE"; fi
