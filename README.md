@@ -12,7 +12,7 @@ between otherwise fresh agent processes.
 ralph-ready issue
         |
         v
-create isolated worktree on ralph/issue-<number>
+create isolated worktree from base or existing draft-PR head
         |
         v
 run a fresh agent process for one iteration
@@ -53,8 +53,9 @@ actual completed diff. After the implementation loop completes, the controller
 commits any remaining tracked work.
 If automatic review is configured, it runs the bounded review/fix loop before
 pushing; otherwise it proceeds immediately. It then pushes the branch, opens a
-draft PR, replaces `ralph-running` with `ralph-review`, and requests the
-configured reviewer. The PR is never merged automatically. If the run exits
+new draft PR or updates the existing one, replaces `ralph-running` with
+`ralph-review`, and requests the configured reviewer on new PRs. The PR is
+never merged automatically. If the run exits
 unsuccessfully, the issue is labeled `ralph-failed` so it can be inspected and
 returned to `ralph-ready` for another attempt.
 
@@ -186,6 +187,27 @@ ralph-gh next --reviewer YOUR_GITHUB_LOGIN
 ralph-gh status 42
 ```
 
+## Continue an existing draft PR
+
+An issue can be steered again after its draft PR has opened:
+
+1. Edit the issue body or add an issue comment with the new requirement.
+2. Reapply `ralph-ready` to the issue.
+3. Run `ralph-gh next`, `ralph-gh run <number>`, or let the daemon claim it.
+
+When the matching `ralph/issue-<number>` branch already has an open draft PR,
+Ralph fetches that remote branch into a fresh worktree and continues from its
+current head. Every iteration receives the complete updated issue body, all
+issue comments, the existing commits, and the full diff against the PR base.
+After implementation, configured verification, and optional automatic review,
+Ralph pushes additional commits without force and refreshes the existing PR
+title and body instead of opening another PR.
+
+Resumption is deliberately strict. Ralph refuses to overwrite a dirty retained
+worktree, resume a non-draft PR, reuse a branch associated with a closed or
+merged PR, target a different explicit base, or choose between multiple open
+PRs. These cases mark the issue `ralph-failed` with an actionable comment.
+
 ## Daemon
 
 Run a sequential worker that continuously processes the oldest
@@ -223,7 +245,10 @@ atomic across multiple daemon processes.
 
 ## Human steering
 
-Comment on the issue while the loop runs. Before every fresh iteration, `ralph-gh` refreshes the issue body and comments into `.ralph/issue.md`.
+Comment on the issue while the loop runs. Before every fresh iteration,
+`ralph-gh` refreshes the issue body and comments into `.ralph/issue.md`. After
+a draft PR opens, add or edit issue content and reapply `ralph-ready` to resume
+the same PR branch.
 
 ## Security
 

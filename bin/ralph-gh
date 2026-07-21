@@ -40,13 +40,13 @@ ISSUE=""
 if [[ "$COMMAND" == run || "$COMMAND" == status ]]; then ISSUE=${1:-}; [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "Issue number required"; shift; fi
 REPO=""; MAX_ITERATIONS=${RALPH_MAX_ITERATIONS:-10}; AGENT_CMD=${RALPH_AGENT_CMD:-}; REVIEW_AGENT_CMD=${RALPH_REVIEW_AGENT_CMD:-}; REVIEW_DISABLED=0; MAX_REVIEW_ROUNDS=${RALPH_MAX_REVIEW_ROUNDS:-3}; POLL_INTERVAL=${RALPH_POLL_INTERVAL:-60}; VERIFY_CMD=${RALPH_VERIFY_CMD:-}; VERIFY_DISABLED=0
 READY_LABEL=${RALPH_READY_LABEL:-ralph-ready}; RUNNING_LABEL=${RALPH_RUNNING_LABEL:-ralph-running}; REVIEW_LABEL=${RALPH_REVIEW_LABEL:-ralph-review}; FAILED_LABEL=${RALPH_FAILED_LABEL:-ralph-failed}
-BASE=""; REVIEWER=${RALPH_REVIEWER:-}; OPEN_PR=1; COMMENTS=1; KEEP_WORKTREE=0; WORK_ROOT=${RALPH_WORK_ROOT:-${TMPDIR:-/tmp}/ralph-gh}
+BASE=""; BASE_EXPLICIT=0; REVIEWER=${RALPH_REVIEWER:-}; OPEN_PR=1; COMMENTS=1; KEEP_WORKTREE=0; PRESERVE_WORKTREE_ON_FAILURE=0; WORK_ROOT=${RALPH_WORK_ROOT:-${TMPDIR:-/tmp}/ralph-gh}
 while [[ $# -gt 0 ]]; do
  case "$1" in
   --repo) REPO=$2; shift 2;; --max-iterations) MAX_ITERATIONS=$2; shift 2;; --agent-cmd) AGENT_CMD=$2; shift 2;;
   --review-agent-cmd) REVIEW_AGENT_CMD=$2; REVIEW_DISABLED=0; shift 2;; --max-review-rounds) MAX_REVIEW_ROUNDS=$2; shift 2;; --no-review) REVIEW_AGENT_CMD=""; REVIEW_DISABLED=1; shift;;
   --poll-interval) POLL_INTERVAL=$2; shift 2;; --verify-cmd) VERIFY_CMD=$2; VERIFY_DISABLED=0; shift 2;; --no-verify) VERIFY_CMD=""; VERIFY_DISABLED=1; shift;;
-  --base) BASE=$2; shift 2;; --reviewer) REVIEWER=$2; shift 2;; --no-pr) OPEN_PR=0; shift;; --no-comments) COMMENTS=0; shift;; --keep-worktree) KEEP_WORKTREE=1; shift;;
+  --base) BASE=$2; BASE_EXPLICIT=1; shift 2;; --reviewer) REVIEWER=$2; shift 2;; --no-pr) OPEN_PR=0; shift;; --no-comments) COMMENTS=0; shift;; --keep-worktree) KEEP_WORKTREE=1; shift;;
   -h|--help) usage; exit 0;; *) die "Unknown option: $1";;
  esac
 done
@@ -74,33 +74,61 @@ ensure_label(){ gh label create "$1" -R "$REPO" --color "$2" --description "$3" 
 create_labels(){ ensure_label "$READY_LABEL" 0E8A16 "Approved for Ralph execution"; ensure_label "$RUNNING_LABEL" FBCA04 "Ralph is working"; ensure_label "$REVIEW_LABEL" 1D76DB "Draft PR ready for review"; ensure_label "$FAILED_LABEL" B60205 "Ralph failed"; }
 if [[ "$COMMAND" == labels ]]; then create_labels; log "Labels ready"; exit 0; fi
 if [[ "$COMMAND" == next ]]; then ISSUE=$(gh issue list -R "$REPO" --state open --label "$READY_LABEL" --limit 100 --json number,createdAt --jq 'sort_by(.createdAt) | .[0].number // empty'); [[ -n "$ISSUE" ]] || die "No issue labeled $READY_LABEL"; fi
-issue_json=$(gh issue view "$ISSUE" -R "$REPO" --json number,title,body,url,state,labels,comments)
-TITLE=$(jq -r .title <<<"$issue_json"); ISSUE_URL=$(jq -r .url <<<"$issue_json"); BRANCH="ralph/issue-$ISSUE"
+issue_json=$(gh issue view "$ISSUE" -R "$REPO" --json number,title,body,url,state,labels,comments,updatedAt)
+TITLE=$(jq -r .title <<<"$issue_json"); ISSUE_URL=$(jq -r .url <<<"$issue_json"); ISSUE_UPDATED_AT=$(jq -r '.updatedAt // "unknown"' <<<"$issue_json"); BRANCH="ralph/issue-$ISSUE"
 if [[ "$COMMAND" == status ]]; then printf 'Repository: %s\nIssue: #%s %s\nURL: %s\nBranch: %s\n' "$REPO" "$ISSUE" "$TITLE" "$ISSUE_URL" "$BRANCH"; gh pr list -R "$REPO" --head "$BRANCH" --state all --json number,state,isDraft,url --jq '.[] | "PR #\(.number) [\(.state)] draft=\(.isDraft) \(.url)"'; exit 0; fi
 [[ "$COMMAND" == run || "$COMMAND" == next ]] || die "Unknown command"
 [[ -n "$AGENT_CMD" ]] || die "Set RALPH_AGENT_CMD or --agent-cmd"; [[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || die "Bad iteration count"
 [[ -z "$REVIEW_AGENT_CMD" || "$MAX_REVIEW_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "Bad review round count"
 create_labels
 labels=$(jq -r '.labels[].name' <<<"$issue_json"); { grep -Fxq "$READY_LABEL" <<<"$labels" || grep -Fxq "$RUNNING_LABEL" <<<"$labels"; } || die "Issue needs $READY_LABEL"
-existing=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty'); [[ -z "$existing" ]] || die "Open PR already exists: $existing"
 ORIGINAL_REPO=$(git rev-parse --show-toplevel); SLUG=${REPO//\//-}; WORKTREE="$WORK_ROOT/$SLUG-issue-$ISSUE"; STATE_DIR="$WORKTREE/.ralph"; RUN_LOG="$STATE_DIR/run.log"
 cleanup(){
  local rc=$? failure_comment retained details_section="" formatted_details
  if [[ $rc -ne 0 ]]; then
   [[ -n "$FAILURE_REASON" ]] || FAILURE_REASON="The run exited with status $rc."
-  if [[ $KEEP_WORKTREE -eq 1 ]]; then retained="The worktree was retained for inspection."; else retained="Inspect the daemon or controller output for the full log."; fi
+  if [[ $KEEP_WORKTREE -eq 1 || $PRESERVE_WORKTREE_ON_FAILURE -eq 1 ]]; then retained="The worktree was retained for inspection."; else retained="Inspect the daemon or controller output for the full log."; fi
   if [[ -n "$FAILURE_DETAILS" ]]; then formatted_details=$(printf '%s\n' "$FAILURE_DETAILS" | sed 's/^/    /'); printf -v details_section '\n\n### Error output\n\n%s' "$formatted_details"; fi
   printf -v failure_comment '## ❌ Ralph failed\n\n> [!CAUTION]\n> **Stage:** %s  \n> **Reason:** %s  \n> **Exit status:** `%s`%s\n\n%s\n\nAfter correcting the problem, reapply `%s` to retry.' "$CURRENT_STAGE" "$FAILURE_REASON" "$rc" "$details_section" "$retained" "$READY_LABEL"
-  gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$FAILED_LABEL" >/dev/null 2>&1 || true
+  gh issue edit "$ISSUE" -R "$REPO" --remove-label "$READY_LABEL" --remove-label "$RUNNING_LABEL" --remove-label "$REVIEW_LABEL" --add-label "$FAILED_LABEL" >/dev/null 2>&1 || true
   [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "$failure_comment" >/dev/null 2>&1 || true
  fi
- if [[ $KEEP_WORKTREE -eq 0 && -d "$WORKTREE" ]]; then git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true; fi
+ if [[ $KEEP_WORKTREE -eq 0 && $PRESERVE_WORKTREE_ON_FAILURE -eq 0 && -d "$WORKTREE" ]]; then git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true; fi
  exit $rc
 }
 CURRENT_STAGE="setting up the isolated worktree"
 trap cleanup EXIT
-mkdir -p "$WORK_ROOT"; git -C "$ORIGINAL_REPO" fetch origin "$BASE"; rm -rf "$WORKTREE"; git -C "$ORIGINAL_REPO" branch -D "$BRANCH" >/dev/null 2>&1 || true; git -C "$ORIGINAL_REPO" worktree add -b "$BRANCH" "$WORKTREE" "origin/$BASE"; mkdir -p "$STATE_DIR"
+CURRENT_STAGE="checking pull request state"
+pr_list_json=$(gh pr list -R "$REPO" --head "$BRANCH" --state all --limit 20 --json number,url,state,isDraft,headRefName,baseRefName 2>/dev/null); pr_list_json=${pr_list_json:-[]}
+open_pr_count=$(jq '[.[] | select(.state == "OPEN")] | length' <<<"$pr_list_json")
+historical_pr_count=$(jq '[.[] | select(.state != "OPEN")] | length' <<<"$pr_list_json")
+[[ $open_pr_count -le 1 ]] || die "Multiple open pull requests use branch $BRANCH"
+RESUME_PR=0; PR_NUMBER=""; PR_URL=""
+if [[ $open_pr_count -eq 1 ]]; then
+ open_pr=$(jq -c '.[] | select(.state == "OPEN")' <<<"$pr_list_json")
+ [[ $(jq -r .isDraft <<<"$open_pr") == true ]] || die "The existing pull request is no longer a draft: $(jq -r .url <<<"$open_pr")"
+ [[ $(jq -r .headRefName <<<"$open_pr") == "$BRANCH" ]] || die "The existing pull request does not use expected branch $BRANCH"
+ pr_base=$(jq -r .baseRefName <<<"$open_pr")
+ if [[ $BASE_EXPLICIT -eq 1 && "$BASE" != "$pr_base" ]]; then die "Existing draft PR targets $pr_base, not requested base $BASE"; fi
+ BASE=$pr_base; PR_NUMBER=$(jq -r .number <<<"$open_pr"); PR_URL=$(jq -r .url <<<"$open_pr"); RESUME_PR=1
+elif [[ $historical_pr_count -gt 0 ]]; then
+ historical_url=$(jq -r '.[0].url' <<<"$pr_list_json"); historical_state=$(jq -r '.[0].state' <<<"$pr_list_json")
+ die "Cannot reuse $BRANCH because its previous pull request is $historical_state: $historical_url"
+fi
+CURRENT_STAGE="setting up the isolated worktree"
+mkdir -p "$WORK_ROOT"
+if [[ -e "$WORKTREE" ]]; then
+ if ! git -C "$WORKTREE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then PRESERVE_WORKTREE_ON_FAILURE=1; die "Worktree path already exists and is not a Git worktree: $WORKTREE"; fi
+ worktree_changes=$(git -C "$WORKTREE" status --porcelain --untracked-files=all | grep -v '^?? .ralph/' || true)
+ if [[ -n "$worktree_changes" ]]; then PRESERVE_WORKTREE_ON_FAILURE=1; die "Existing worktree has uncommitted changes; inspect it before retrying: $WORKTREE"; fi
+ git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE"
+fi
+git -C "$ORIGINAL_REPO" fetch origin "$BASE"
+if [[ $RESUME_PR -eq 1 ]]; then git -C "$ORIGINAL_REPO" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; START_REF="origin/$BRANCH"; else START_REF="origin/$BASE"; fi
+git -C "$ORIGINAL_REPO" branch -D "$BRANCH" >/dev/null 2>&1 || true
+git -C "$ORIGINAL_REPO" worktree add -b "$BRANCH" "$WORKTREE" "$START_REF"; mkdir -p "$STATE_DIR"
 EXCLUDE_FILE=$(git -C "$WORKTREE" rev-parse --git-path info/exclude); grep -Fxq ".ralph/" "$EXCLUDE_FILE" 2>/dev/null || printf ".ralph/\n" >> "$EXCLUDE_FILE"
+if [[ $RESUME_PR -eq 1 ]]; then RUN_CONTEXT="Resuming draft PR #$PR_NUMBER ($PR_URL) from its current remote head."; else RUN_CONTEXT="Creating a new implementation branch and draft PR."; fi
 write_issue(){ local j body comments; j=$(gh issue view "$ISSUE" -R "$REPO" --json body,comments); body=$(jq -r '.body // ""' <<<"$j"); comments=$(jq -r '.comments[]? | "### Comment by @\(.author.login)\n\(.body)\n"' <<<"$j"); cat > "$STATE_DIR/issue.md" <<ISSUEFILE
 # GitHub issue #$ISSUE: $TITLE
 
@@ -108,6 +136,7 @@ Issue URL: $ISSUE_URL
 Repository: $REPO
 Base branch: $BASE
 Working branch: $BRANCH
+Run context: $RUN_CONTEXT
 
 ## Issue body
 
@@ -122,12 +151,13 @@ write_issue
 cat > "$STATE_DIR/prompt.md" <<'PROMPT'
 You are one fresh iteration of a Ralph-style coding loop.
 Read `.ralph/issue.md`, repository instruction files such as `AGENTS.md`, `.ralph/progress.md` if present, recent git history, and the current diff.
+If `.ralph/issue.md` says this run is resuming a draft PR, treat the existing branch as prior implementation. Reconcile the complete branch with the latest issue body and every issue comment, including changing or removing earlier work when the updated specification requires it.
 Make the smallest coherent step toward resolving the issue. Inspect before editing. Implement real code/tests/docs. Run focused checks. Commit a coherent passing step. Append concise durable notes to `.ralph/progress.md` with changes, commands, failures, and the best next step.
 Create or update `.ralph/pr-summary.md` with a concise, user-facing bullet list of what the branch now implements. Describe actual behavior and tests in the complete diff, not the process, intentions, or iteration history. Do not include a heading because the runner adds it.
 Do not use `gh`, push, open or merge a PR, close the issue, or modify workflow files unless explicitly requested. When configured, the outer runner decides completion with deterministic verification.
 PROMPT
-: > "$RUN_LOG"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$READY_LABEL" --remove-label "$FAILED_LABEL" --add-label "$RUNNING_LABEL" >/dev/null
-[[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph started branch \`$BRANCH\` with up to $MAX_ITERATIONS fresh iterations." >/dev/null
+: > "$RUN_LOG"; gh issue edit "$ISSUE" -R "$REPO" --remove-label "$READY_LABEL" --remove-label "$FAILED_LABEL" --remove-label "$REVIEW_LABEL" --add-label "$RUNNING_LABEL" >/dev/null
+if [[ $COMMENTS -eq 1 ]]; then if [[ $RESUME_PR -eq 1 ]]; then gh issue comment "$ISSUE" -R "$REPO" --body "Ralph resumed draft PR #$PR_NUMBER on branch \`$BRANCH\` with the latest issue body and comments." >/dev/null; else gh issue comment "$ISSUE" -R "$REPO" --body "Ralph started branch \`$BRANCH\` with up to $MAX_ITERATIONS fresh iterations." >/dev/null; fi; fi
 verified=0
 for ((i=1;i<=MAX_ITERATIONS;i++)); do
  CURRENT_STAGE="agent iteration $i/$MAX_ITERATIONS"
@@ -221,6 +251,8 @@ fi
 cat > "$STATE_DIR/pr-body.md" <<PRBODY
 Closes #$ISSUE
 
+<!-- ralph-gh: issue-updated-at=$ISSUE_UPDATED_AT -->
+
 ## Summary
 $pr_summary
 
@@ -238,12 +270,21 @@ $review_summary
 ## Review guidance
 Please verify scope, correctness, tests, compatibility, and security. This PR is never merged automatically.
 PRBODY
-CURRENT_STAGE="creating the draft pull request"
-args=(--repo "$REPO" --base "$BASE" --head "$BRANCH" --draft --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md"); [[ -z "$REVIEWER" ]] || args+=(--reviewer "$REVIEWER")
-pr_log="$STATE_DIR/pr-create.log"
-set +e; (cd "$WORKTREE" && gh pr create "${args[@]}") 2>&1 | tee "$pr_log" | tee -a "$RUN_LOG"; pr_rc=${PIPESTATUS[0]}; set -e
-if [[ $pr_rc -ne 0 ]]; then set_failure_details "$pr_log"; die "Failed to create the draft pull request"; fi
-PR_URL=$(grep -Eo 'https?://[^[:space:]]+/pull/[0-9]+' "$pr_log" | tail -n 1 || true)
-if [[ -z "$PR_URL" ]]; then set_failure_details "$pr_log"; die "Draft pull request was created but its URL could not be determined"; fi
-gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph opened a $completion_description: $PR_URL" >/dev/null
+pr_log="$STATE_DIR/pr-update.log"
+if [[ $RESUME_PR -eq 1 ]]; then
+ CURRENT_STAGE="updating draft pull request #$PR_NUMBER"
+ set +e; (cd "$WORKTREE" && gh pr edit "$PR_NUMBER" -R "$REPO" --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md") 2>&1 | tee "$pr_log" | tee -a "$RUN_LOG"; pr_rc=${PIPESTATUS[0]}; set -e
+ if [[ $pr_rc -ne 0 ]]; then set_failure_details "$pr_log"; die "Branch was pushed but draft PR #$PR_NUMBER could not be updated"; fi
+ pr_action="updated draft PR #$PR_NUMBER"
+else
+ CURRENT_STAGE="creating the draft pull request"
+ args=(--repo "$REPO" --base "$BASE" --head "$BRANCH" --draft --title "Implement #$ISSUE: $TITLE" --body-file "$STATE_DIR/pr-body.md"); [[ -z "$REVIEWER" ]] || args+=(--reviewer "$REVIEWER")
+ set +e; (cd "$WORKTREE" && gh pr create "${args[@]}") 2>&1 | tee "$pr_log" | tee -a "$RUN_LOG"; pr_rc=${PIPESTATUS[0]}; set -e
+ if [[ $pr_rc -ne 0 ]]; then set_failure_details "$pr_log"; die "Failed to create the draft pull request"; fi
+ PR_URL=$(grep -Eo 'https?://[^[:space:]]+/pull/[0-9]+' "$pr_log" | tail -n 1 || true)
+ if [[ -z "$PR_URL" ]]; then set_failure_details "$pr_log"; die "Draft pull request was created but its URL could not be determined"; fi
+ pr_action="opened a $completion_description"
+fi
+CURRENT_STAGE="marking issue ready for human review"
+gh issue edit "$ISSUE" -R "$REPO" --remove-label "$RUNNING_LABEL" --add-label "$REVIEW_LABEL" >/dev/null; [[ $COMMENTS -eq 0 ]] || gh issue comment "$ISSUE" -R "$REPO" --body "Ralph $pr_action: $PR_URL" >/dev/null
 log "Draft PR: $PR_URL"; trap - EXIT; if [[ $KEEP_WORKTREE -eq 0 ]]; then git -C "$ORIGINAL_REPO" worktree remove --force "$WORKTREE"; else log "Kept worktree: $WORKTREE"; fi
